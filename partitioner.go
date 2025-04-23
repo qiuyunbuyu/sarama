@@ -11,6 +11,7 @@ import (
 // Partitioner is anything that, given a Kafka message and a number of partitions indexed [0...numPartitions-1],
 // decides to which partition to send the message. RandomPartitioner, RoundRobinPartitioner and HashPartitioner are provided
 // as simple default implementations.
+// Go 中的分区器，可以利用这个，看一下 Go 中的接口的体系
 type Partitioner interface {
 	// Partition takes a message and partition count and chooses a partition
 	Partition(message *ProducerMessage, numPartitions int32) (int32, error)

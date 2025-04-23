@@ -49,6 +49,8 @@ type AsyncProducer interface {
 
 	// Input is the input channel for the user to write messages to that they
 	// wish to send.
+	// Go中 chan<- 是个啥？ Go中的 “Channel ” 的概念
+	// Input() 函数的作用 是返回一个用于接收ProducerMessage指针的通道
 	Input() chan<- *ProducerMessage
 
 	// Successes is the success output channel back to the user when Return.Successes is
@@ -105,10 +107,12 @@ type asyncProducer struct {
 
 // NewAsyncProducer creates a new AsyncProducer using the given broker addresses and configuration.
 func NewAsyncProducer(addrs []string, conf *Config) (AsyncProducer, error) {
+	// client(感觉有点像Java里面的 “MetadataClient” ？ )
 	client, err := NewClient(addrs, conf)
 	if err != nil {
 		return nil, err
 	}
+	// AsyncProducer
 	return newAsyncProducer(client)
 }
 

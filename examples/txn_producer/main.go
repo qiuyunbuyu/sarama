@@ -33,8 +33,17 @@ var (
 	recordsRate = metrics.GetOrRegisterMeter("records.rate", nil)
 )
 
+/*
+Q: go 中init()是什么时候调用的？
+A:
+- 包初始化时：当一个包被导入时，Go 语言运行时会自动执行该包中的 init() 函数。如果一个包被多个地方导入，init() 函数只会在首次导入该包时被调用一次
+- 先于 main() 函数：对于 main 包，init() 函数的执行顺序在 main() 函数之前
+*/
 func init() {
 	flag.StringVar(&brokers, "brokers", "", "Kafka bootstrap brokers to connect to, as a comma separated list")
+	// MinVersion     = V0_8_2_0
+	// MaxVersion     = V4_0_0_0
+	// DefaultVersion = V2_1_0_0
 	flag.StringVar(&version, "version", sarama.DefaultVersion.String(), "Kafka cluster version")
 	flag.StringVar(&topic, "topic", "", "Kafka topics where records will be copied from topics.")
 	flag.IntVar(&producers, "producers", 10, "Number of concurrent producers")
@@ -64,55 +73,81 @@ func main() {
 		log.Panicf("Error parsing Kafka version: %v", err)
 	}
 
+	// 生成 producerProvider - 注意这是 2个 入参 哦，一个brokers， 一个 返回 Config 的 func()
 	producerProvider := newProducerProvider(strings.Split(brokers, ","), func() *sarama.Config {
+		// 生成Config
 		config := sarama.NewConfig()
+		// 填充配置
 		config.Version = version
+		// 幂等性
 		config.Producer.Idempotent = true
 		config.Producer.Return.Errors = false
+		// 0 / 1 / -1
 		config.Producer.RequiredAcks = sarama.WaitForAll
 		config.Producer.Partitioner = sarama.NewRoundRobinPartitioner
 		config.Producer.Transaction.Retry.Backoff = 10
 		config.Producer.Transaction.ID = "txn_producer"
+		// 飞行中的 Request 数量
 		config.Net.MaxOpenRequests = 1
+		// 返回 *sarama.Config
 		return config
 	})
 
 	go metrics.Log(metrics.DefaultRegistry, 5*time.Second, log.New(os.Stderr, "metrics: ", log.LstdFlags))
 
+	// go中context的概念
 	ctx, cancel := context.WithCancel(context.Background())
-
+	// 声明了一个 sync.WaitGroup 类型的变量 wg。sync.WaitGroup 用于协调多个 goroutine 的同步，它可以用来等待一组 goroutine 完成工作
 	var wg sync.WaitGroup
+
+	// 并发数
 	for i := 0; i < producers; i++ {
+		// 在 WaitGroup 中增加一个计数，用来表示有一个新的 goroutine 开始工作
 		wg.Add(1)
+		// 创建并启动一个匿名的 goroutine
 		go func() {
+			// 使用 defer 关键字确保在这个 goroutine 结束时，调用 wg.Done() 来将 WaitGroup 的计数减 1 ，表示该 goroutine 工作完成
 			defer wg.Done()
 
+			// 一个无限循环，会一直执行循环体中的代码，直到遇到return语句跳出循环
 			for {
+				// select语句用于在多个通道操作中进行选择，类似于switch语句，但用于通道
 				select {
+				// "Done returns a channel that's closed when work done on behalf of this context should be canceled"
 				case <-ctx.Done():
 					return
+				// 调用 produceTestRecord
 				default:
 					produceTestRecord(producerProvider)
 				}
 			}
-		}()
+		}() // 最后的括号表示立即调用这个匿名函数，并启动一个新的Goroutine来执行它
 	}
 
+	// 创建了一个缓冲通道 sigterm，用于接收操作系统信号
 	sigterm := make(chan os.Signal, 1)
+
+	// signal.Notify 函数用于注册要接收的信号。这里注册了两个信号：syscall.SIGINT（通常是用户按下 Ctrl+C 时发送的信号）和 syscall.SIGTERM（程序终止信号 ）。
+	// 当这些信号发生时，对应的信号值会被发送到 sigterm 通道。
 	signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM)
 
+	// 循环内部使用 <-sigterm 从信号通道接收信号。当接收到 SIGINT 或 SIGTERM 信号时，会打印一条日志信息 "terminating: via signal"，然后将 keepRunning 设置为 false ，从而退出循环
 	for keepRunning {
 		<-sigterm
 		log.Println("terminating: via signal")
 		keepRunning = false
 	}
+
+	// 会向基于 ctx 衍生出的所有相关协程发送取消信号
 	cancel()
+	// wg.Wait() 会阻塞当前 goroutine，直到所有通过 wg.Add 添加的计数都通过 wg.Done 完成，通常用于等待一组 goroutine 完成任务
 	wg.Wait()
 
 	producerProvider.clear()
 }
 
 func produceTestRecord(producerProvider *producerProvider) {
+	// 从 producerProvider 取得 AsyncProducer
 	producer := producerProvider.borrow()
 	defer producerProvider.release(producer)
 
@@ -163,39 +198,74 @@ func produceTestRecord(producerProvider *producerProvider) {
 
 // pool of producers that ensure transactional-id is unique.
 type producerProvider struct {
+	// 事务ID-唯一
 	transactionIdGenerator int32
 
+	// Go 语言标准库中的互斥锁
 	producersLock sync.Mutex
-	producers     []sarama.AsyncProducer
 
+	// 用于存储多个 kafka AsyncProducer
+	producers []sarama.AsyncProducer
+
+	// 函数类型的字段，该函数不接受任何参数，返回一个 sarama.AsyncProducer 类型的对象
 	producerProvider func() sarama.AsyncProducer
 }
 
+/*
+*
+param1 - brokers []string
+param2 - producerConfigurationProvider func() *sarama.Config
+
+	这是一个函数类型的参数，该函数不接受任何参数，返回一个指向 sarama.Config 结构体的指针
+
+说人话就是 告诉 producerProvider 怎么利用 brokers 和 config 来生成 AsyncProducer
+*/
 func newProducerProvider(brokers []string, producerConfigurationProvider func() *sarama.Config) *producerProvider {
+	// 创建了一个 producerProvider 结构体的实例，并将其地址赋值给变量 provider
 	provider := &producerProvider{}
+
+	// 初始化 producerProvider 中 producerProvider字段，说直白点就是生成 [sarama.AsyncProducer] 的函数
 	provider.producerProvider = func() sarama.AsyncProducer {
+		// config
 		config := producerConfigurationProvider()
+		// 生成 独立的 [ Transaction.ID ]
 		suffix := provider.transactionIdGenerator
 		// Append transactionIdGenerator to current config.Producer.Transaction.ID to ensure transaction-id uniqueness.
 		if config.Producer.Transaction.ID != "" {
 			provider.transactionIdGenerator++
 			config.Producer.Transaction.ID = config.Producer.Transaction.ID + "-" + fmt.Sprint(suffix)
 		}
+		// 利用 brokers, config 生成 AsyncProducer
 		producer, err := sarama.NewAsyncProducer(brokers, config)
 		if err != nil {
 			return nil
 		}
 		return producer
 	}
+
 	return provider
 }
 
+/*
+*
+
+	入参：producerProvide
+	入参：producerProvider
+	返回: AsyncProducer
+
+	尝试从 []sarama.AsyncProducer 中取得 AsyncProducer，没有就创建返回
+*/
 func (p *producerProvider) borrow() (producer sarama.AsyncProducer) {
+	// p.producersLock 对共享资源 [ producers []sarama.AsyncProducer ] 上锁
 	p.producersLock.Lock()
+
+	// defer 关键字确保无论函数以何种方式结束（正常返回或发生错误），都会执行 Unlock 操作来释放锁，保证资源的正确访问控制
 	defer p.producersLock.Unlock()
 
+	// producerProvider 池子中 AsyncProducer 为空
 	if len(p.producers) == 0 {
 		for {
+			// 创建一个 producer， 并直接返回
 			producer = p.producerProvider()
 			if producer != nil {
 				return
@@ -203,8 +273,11 @@ func (p *producerProvider) borrow() (producer sarama.AsyncProducer) {
 		}
 	}
 
+	// 如果资源池不为空，获取资源池中最后一个生产者实例（通过计算索引 len(p.producers) - 1 ）
 	index := len(p.producers) - 1
+	// 按索引取到 AsyncProducer
 	producer = p.producers[index]
+	// 然后从资源池中移除该生产者（通过切片操作 p.producers[:index] ，丢弃最后一个元素）
 	p.producers = p.producers[:index]
 	return
 }

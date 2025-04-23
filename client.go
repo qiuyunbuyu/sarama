@@ -194,7 +194,8 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 	}
 
 	client := &client{
-		conf:                    conf,
+		conf: conf,
+		// for shutting down background metadata updater
 		closer:                  make(chan none),
 		closed:                  make(chan none),
 		brokers:                 make(map[int32]*Broker),
@@ -514,6 +515,7 @@ func (client *client) RefreshMetadata(topics ...string) error {
 	if client.conf.Metadata.Timeout > 0 {
 		deadline = time.Now().Add(client.conf.Metadata.Timeout)
 	}
+	// 获取 topic 元数据
 	return client.tryRefreshMetadata(topics, client.conf.Metadata.Retry.Max, deadline)
 }
 
@@ -983,12 +985,14 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 			allowAutoTopicCreation = false
 			DebugLogger.Printf("client/metadata fetching metadata for all topics from broker %s\n", broker.addr)
 		}
-
+		// 构建 MetadataRequest
 		req := NewMetadataRequest(client.conf.Version, topics)
 		req.AllowAutoTopicCreation = allowAutoTopicCreation
 		atomic.StoreInt64(&client.updateMetadataMs, time.Now().UnixMilli())
 
+		// 发送 MetadataRequest， 接收 MetadataResponse
 		response, err := broker.GetMetadata(req)
+
 		var kerror KError
 		var packetEncodingError PacketEncodingError
 		if err == nil {
