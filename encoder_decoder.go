@@ -87,6 +87,7 @@ func versionedDecode(buf []byte, in versionedDecoder, version int16, metricRegis
 		raw:      buf,
 		registry: metricRegistry,
 	}
+	// 解码
 	err := in.decode(&helper, version)
 	if err != nil {
 		return err

@@ -40,12 +40,12 @@ A:
 - 先于 main() 函数：对于 main 包，init() 函数的执行顺序在 main() 函数之前
 */
 func init() {
-	flag.StringVar(&brokers, "brokers", "", "Kafka bootstrap brokers to connect to, as a comma separated list")
+	flag.StringVar(&brokers, "brokers", "kafka9001:9092", "Kafka bootstrap brokers to connect to, as a comma separated list")
 	// MinVersion     = V0_8_2_0
 	// MaxVersion     = V4_0_0_0
 	// DefaultVersion = V2_1_0_0
 	flag.StringVar(&version, "version", sarama.DefaultVersion.String(), "Kafka cluster version")
-	flag.StringVar(&topic, "topic", "", "Kafka topics where records will be copied from topics.")
+	flag.StringVar(&topic, "topic", "EOC_ALERT_MESSAGE_TOPIC", "Kafka topics where records will be copied from topics.")
 	flag.IntVar(&producers, "producers", 10, "Number of concurrent producers")
 	flag.Int64Var(&recordsNumber, "records-number", 10000, "Number of records sent per loop")
 	flag.BoolVar(&verbose, "verbose", false, "Sarama logging")
@@ -147,25 +147,30 @@ func main() {
 }
 
 func produceTestRecord(producerProvider *producerProvider) {
-	// 从 producerProvider 取得 AsyncProducer
+	// 1. 从 producerProvider 取得 AsyncProducer
 	producer := producerProvider.borrow()
 	defer producerProvider.release(producer)
 
-	// Start kafka transaction
+	// 2. Start kafka transaction
 	err := producer.BeginTxn()
 	if err != nil {
 		log.Printf("unable to start txn %s\n", err)
 		return
 	}
 
-	// Produce some records in transaction
+	// 3. Produce some records in transaction
 	var i int64
 	for i = 0; i < recordsNumber; i++ {
+		// 看上去 只是吧 数据放进了 ”Channel“中，是怎么运转起来的呢 ？
+		// 猜测 一定有另一个”线程“ 从 chan *ProducerMessage 中取走
 		producer.Input() <- &sarama.ProducerMessage{Topic: topic, Key: nil, Value: sarama.StringEncoder("test")}
+
 	}
 
-	// commit transaction
+	// 4. commit transaction
 	err = producer.CommitTxn()
+
+	// 5. err检测与重试
 	if err != nil {
 		log.Printf("Producer: unable to commit txn %s\n", err)
 		for {

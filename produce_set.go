@@ -22,6 +22,7 @@ type produceSet struct {
 	bufferCount int
 }
 
+// 生成 produceSet
 func newProduceSet(parent *asyncProducer) *produceSet {
 	pid, epoch := parent.txnmgr.getProducerID()
 	return &produceSet{

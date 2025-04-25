@@ -94,7 +94,7 @@ type asyncProducer struct {
 	errors                    chan *ProducerError
 	input, successes, retries chan *ProducerMessage
 	inFlight                  sync.WaitGroup
-
+	// key-Broker | value-brokerProducer
 	brokers    map[*Broker]*brokerProducer
 	brokerRefs map[*brokerProducer]int
 	brokerLock sync.Mutex
@@ -136,6 +136,7 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 		return nil, err
 	}
 
+	// 构建实际的 [ AsyncProducer ]
 	p := &asyncProducer{
 		client:          client,
 		conf:            client.Config(),
@@ -150,6 +151,7 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 	}
 
 	// launch our singleton dispatchers
+	// 开启了两个 goroutine，一个为 dispatcher，一个为 retryHandler
 	go withRecover(p.dispatcher)
 	go withRecover(p.retryHandler)
 
@@ -405,10 +407,14 @@ func (p *asyncProducer) AsyncClose() {
 // singleton
 // dispatches messages by topic
 func (p *asyncProducer) dispatcher() {
+	// key[String msg.Topic] | value[ chan<- *ProducerMessage ]
 	handlers := make(map[string]chan<- *ProducerMessage)
 	shuttingDown := false
 
+	// ** 遍历 [ chan *ProducerMessage ]
 	for msg := range p.input {
+
+		// --------------- ProducerMessage 校验
 		if msg == nil {
 			Logger.Println("Something tried to send a nil message, it was ignored.")
 			continue
@@ -456,10 +462,12 @@ func (p *asyncProducer) dispatcher() {
 			}
 		}
 
+		// --------------- 拦截器对ProducerMessage处理
 		for _, interceptor := range p.conf.Producer.Interceptors {
 			msg.safelyApplyInterceptor(interceptor)
 		}
 
+		// --------------- ProducerMessage 的 校验
 		version := 1
 		if p.conf.Version.IsAtLeast(V0_11_0_0) {
 			version = 2
@@ -474,12 +482,13 @@ func (p *asyncProducer) dispatcher() {
 			continue
 		}
 
+		// --------------- 找到此 msg 对应 Topic 的  buffered channel
 		handler := handlers[msg.Topic]
 		if handler == nil {
 			handler = p.newTopicProducer(msg.Topic)
 			handlers[msg.Topic] = handler
 		}
-
+		// 将 ProducerMessage 放入对应 Topic 的 buffered channel 中
 		handler <- msg
 	}
 
@@ -495,13 +504,17 @@ type topicProducer struct {
 	topic  string
 	input  <-chan *ProducerMessage
 
-	breaker     *breaker.Breaker
+	breaker *breaker.Breaker
+	// [TopicPartition对应序号，chan<- *ProducerMessage]
 	handlers    map[int32]chan<- *ProducerMessage
 	partitioner Partitioner
 }
 
 func (p *asyncProducer) newTopicProducer(topic string) chan<- *ProducerMessage {
+	// 在这里创建了一个缓冲大小为ChannelBufferSize的channel，用于存放发送到这个主题的消息
 	input := make(chan *ProducerMessage, p.conf.ChannelBufferSize)
+
+	// topicProducer 在 asyncProducer 上又抽象了一层
 	tp := &topicProducer{
 		parent:      p,
 		topic:       topic,
@@ -510,6 +523,7 @@ func (p *asyncProducer) newTopicProducer(topic string) chan<- *ProducerMessage {
 		handlers:    make(map[int32]chan<- *ProducerMessage),
 		partitioner: p.conf.Producer.Partitioner(topic),
 	}
+	// 又启动了一个 goroutine 用于处理消息, 到了这一步，对于每一个Topic，都有一个协程来处理消息
 	go withRecover(tp.dispatch)
 	return input
 }
@@ -522,9 +536,10 @@ func (tp *topicProducer) dispatch() {
 				continue
 			}
 		}
-
+		// 拿到对应的 Partition 对应的 Channel
 		handler := tp.handlers[msg.Partition]
 		if handler == nil {
+			// 还能套的呀，怎么还有一个 partitionProducer ---
 			handler = tp.parent.newPartitionProducer(msg.Topic, msg.Partition)
 			tp.handlers[msg.Partition] = handler
 		}
@@ -606,6 +621,7 @@ type partitionRetryState struct {
 
 func (p *asyncProducer) newPartitionProducer(topic string, partition int32) chan<- *ProducerMessage {
 	input := make(chan *ProducerMessage, p.conf.ChannelBufferSize)
+	//  partitionProducer 内部还有一个 brokerProducer
 	pp := &partitionProducer{
 		parent:    p,
 		topic:     topic,
@@ -615,6 +631,7 @@ func (p *asyncProducer) newPartitionProducer(topic string, partition int32) chan
 		breaker:    breaker.New(3, 1, 10*time.Second),
 		retryState: make([]partitionRetryState, p.conf.Producer.Retry.Max+1),
 	}
+	// PartitionProducer 的 dispatch()
 	go withRecover(pp.dispatch)
 	return input
 }
@@ -647,8 +664,10 @@ func (pp *partitionProducer) updateLeaderIfBrokerProducerIsNil(msg *ProducerMess
 func (pp *partitionProducer) dispatch() {
 	// try to prefetch the leader; if this doesn't work, we'll do a proper call to `updateLeader`
 	// on the first message
+	// 1. 找到对应的 Topic-Partition-x 对应的 Leader Replica 对应的 *Broker 信息
 	pp.leader, _ = pp.parent.client.Leader(pp.topic, pp.partition)
 	if pp.leader != nil {
+		// 找到对应的 [ brokerProducer ]
 		pp.brokerProducer = pp.parent.getBrokerProducer(pp.leader)
 		pp.parent.inFlight.Add(1) // we're generating a syn message; track it so we don't shut down while it's still inflight
 		pp.brokerProducer.input <- &ProducerMessage{Topic: pp.topic, Partition: pp.partition, flags: syn}
@@ -790,6 +809,7 @@ func (pp *partitionProducer) updateLeader() error {
 
 // one per broker; also constructs an associated flusher
 func (p *asyncProducer) newBrokerProducer(broker *Broker) *brokerProducer {
+	// BrokerProducer 维护了 多个 chan
 	var (
 		input     = make(chan *ProducerMessage)
 		bridge    = make(chan *produceSet)
@@ -813,7 +833,10 @@ func (p *asyncProducer) newBrokerProducer(broker *Broker) *brokerProducer {
 		// Use a wait group to know if we still have in flight requests
 		var wg sync.WaitGroup
 
+		// 遍历 produceSet | chan *produceSet
 		for set := range bridge {
+
+			// [produceSet] -> ProduceRequest
 			request := set.buildRequest()
 
 			// Count the in flight requests to know when we can close the pending channel safely
@@ -912,10 +935,13 @@ type brokerProducerResponse struct {
 type brokerProducer struct {
 	parent *asyncProducer
 	broker *Broker
-
-	input     chan *ProducerMessage
-	output    chan<- *produceSet
+	// 双向通道，该通道可以发送和接收
+	input chan *ProducerMessage
+	// 名为 output 的只写通道，只能向该通道发送 *produceSet 类型
+	output chan<- *produceSet
+	// 名为 responses 的只读通道，只能从该通道接收 *brokerProducerResponse
 	responses <-chan *brokerProducerResponse
+	// 双向通道，通道中传输的是 struct{} 类型，通常 struct{} 空结构体用于通道只传递信号而不传递实际数据的场景
 	abandoned chan struct{}
 
 	buffer     *produceSet
@@ -931,6 +957,7 @@ func (bp *brokerProducer) run() {
 	var timerChan <-chan time.Time
 	Logger.Printf("producer/broker/%d starting up\n", bp.broker.ID())
 
+	// 事件循环 ？
 	for {
 		select {
 		case msg, ok := <-bp.input:

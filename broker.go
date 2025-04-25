@@ -374,7 +374,7 @@ func (b *Broker) Rack() string {
 func (b *Broker) GetMetadata(request *MetadataRequest) (*MetadataResponse, error) {
 	response := new(MetadataResponse)
 	response.Version = request.Version // Required to ensure use of the correct response header version
-
+	// -.-
 	err := b.sendAndReceive(request, response)
 	if err != nil {
 		return nil, err
@@ -448,6 +448,7 @@ func (b *Broker) AsyncProduce(request *ProduceRequest, cb ProduceCallback) error
 
 		// Create ProduceResponse early to provide the header version
 		res := new(ProduceResponse)
+		// 为了做回调
 		promise = &responsePromise{
 			headerVersion: res.headerVersion(),
 			// Packets will be converted to a ProduceResponse in the responseReceiver goroutine
@@ -466,11 +467,12 @@ func (b *Broker) AsyncProduce(request *ProduceRequest, cb ProduceCallback) error
 
 				// Well-formed response
 				b.handleThrottledResponse(res)
+				// ProduceCallback 回调
 				cb(res, nil)
 			},
 		}
 	}
-
+	// 带着 ProduceRequest 进入了 ”网络层“
 	return b.sendWithPromise(request, promise)
 }
 
@@ -956,10 +958,13 @@ func (b *Broker) readFull(buf []byte) (n int, err error) {
 // write  ensures the conn WriteDeadline has been setup before making a
 // call to conn.Write
 func (b *Broker) write(buf []byte) (n int, err error) {
+
+	// 超时设置 | SetWriteDeadline sets the deadline for future Write calls
 	if err := b.conn.SetWriteDeadline(time.Now().Add(b.conf.Net.WriteTimeout)); err != nil {
 		return 0, err
 	}
 
+	// 发送数据 | Conn is a generic stream-oriented network connection.
 	return b.conn.Write(buf)
 }
 
@@ -990,6 +995,7 @@ func makeResponsePromise(responseHeaderVersion int16) *responsePromise {
 
 // b.lock must be held by caller
 func (b *Broker) sendWithPromise(rb protocolBody, promise *responsePromise) error {
+	// 连接的校验
 	if b.conn == nil {
 		if b.connErr != nil {
 			return b.connErr
@@ -1013,7 +1019,10 @@ func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
 		return ErrUnsupportedVersion
 	}
 
+	// [body] + [head] = [request]
 	req := &request{correlationID: b.correlationID, clientID: b.conf.ClientID, body: rb}
+
+	// 编码 [request -> byte]
 	buf, err := encode(req, b.metricRegistry)
 	if err != nil {
 		return err
@@ -1025,13 +1034,19 @@ func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
 	requestTime := time.Now()
 	// Will be decremented in responseReceiver (except error or request with NoResponse)
 	b.addRequestInFlightMetrics(1)
+
+	// 执行网络层面的发送 - Go中的 net包
 	bytes, err := b.write(buf)
+
+	// 指标更新
 	b.updateOutgoingCommunicationMetrics(bytes)
 	b.updateProtocolMetrics(rb)
 	if err != nil {
 		b.addRequestInFlightMetrics(-1)
 		return err
 	}
+
+	// 协议中 correlationID 递增
 	b.correlationID++
 
 	if promise == nil {
@@ -1048,14 +1063,18 @@ func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
 }
 
 func (b *Broker) sendAndReceive(req protocolBody, res protocolBody) error {
+	// 互斥锁 b.lock 来确保同一时间只有一个 goroutine 可以执行这个方法，避免并发问题
 	b.lock.Lock()
 	defer b.lock.Unlock()
+	// 获取 responseHeaderVersion
 	responseHeaderVersion := int16(-1)
 	if res != nil {
 		responseHeaderVersion = res.headerVersion()
 	}
-
+	// -.-
+	// 返回的是个 responsePromise
 	promise, err := b.send(req, res != nil, responseHeaderVersion)
+
 	if err != nil {
 		return err
 	}
