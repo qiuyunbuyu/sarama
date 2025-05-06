@@ -255,7 +255,7 @@ func (b *Broker) Open(conf *Config) error {
 
 		b.done = make(chan bool)
 		b.responses = make(chan *responsePromise, b.conf.Net.MaxOpenRequests-1)
-
+		// 处理 response
 		go withRecover(b.responseReceiver)
 		if conf.Net.SASL.Enable && !useSaslV0 {
 			b.connErr = b.authenticateViaSASLv1()
@@ -448,7 +448,7 @@ func (b *Broker) AsyncProduce(request *ProduceRequest, cb ProduceCallback) error
 
 		// Create ProduceResponse early to provide the header version
 		res := new(ProduceResponse)
-		// 为了做回调
+		// 又是为了回调
 		promise = &responsePromise{
 			headerVersion: res.headerVersion(),
 			// Packets will be converted to a ProduceResponse in the responseReceiver goroutine
@@ -458,7 +458,7 @@ func (b *Broker) AsyncProduce(request *ProduceRequest, cb ProduceCallback) error
 					cb(nil, err)
 					return
 				}
-
+				// byte解码出response
 				if err := versionedDecode(packets, res, request.version(), metricRegistry); err != nil {
 					// Malformed response
 					cb(nil, err)
@@ -467,7 +467,7 @@ func (b *Broker) AsyncProduce(request *ProduceRequest, cb ProduceCallback) error
 
 				// Well-formed response
 				b.handleThrottledResponse(res)
-				// ProduceCallback 回调
+				// ProduceCallback 回调， 注意其入参
 				cb(res, nil)
 			},
 		}
@@ -1057,6 +1057,7 @@ func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
 
 	promise.requestTime = requestTime
 	promise.correlationID = req.correlationID
+	// broker 的 chan
 	b.responses <- promise
 
 	return nil
@@ -1191,7 +1192,7 @@ func (b *Broker) encode(pe packetEncoder, version int16) (err error) {
 
 func (b *Broker) responseReceiver() {
 	var dead error
-
+	// 遍历处理 response 的逻辑
 	for response := range b.responses {
 		if dead != nil {
 			// This was previously incremented in send() and
@@ -1201,6 +1202,7 @@ func (b *Broker) responseReceiver() {
 			continue
 		}
 
+		// 读取网络byte的逻辑
 		headerLength := getHeaderLength(response.headerVersion)
 		header := make([]byte, headerLength)
 
@@ -1221,6 +1223,7 @@ func (b *Broker) responseReceiver() {
 			response.handle(nil, err)
 			continue
 		}
+		// 比较 correlationID
 		if decodedHeader.correlationID != response.correlationID {
 			b.updateIncomingCommunicationMetrics(bytesReadHeader, requestLatency)
 			// TODO if decoded ID < cur ID, discard until we catch up
@@ -1232,6 +1235,7 @@ func (b *Broker) responseReceiver() {
 
 		buf := make([]byte, decodedHeader.length-int32(headerLength)+4)
 		bytesReadBody, err := b.readFull(buf)
+
 		b.updateIncomingCommunicationMetrics(bytesReadHeader+bytesReadBody, requestLatency)
 		if err != nil {
 			dead = err

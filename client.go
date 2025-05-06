@@ -153,7 +153,7 @@ type client struct {
 	// so we store them separately
 	seedBrokers []*Broker
 	deadSeeds   []*Broker
-
+	// 核心元数据
 	controllerID            int32                                   // cluster controller broker id
 	brokers                 map[int32]*Broker                       // maps broker ids to brokers
 	metadata                map[string]map[int32]*PartitionMetadata // maps topics to partition ids to metadata

@@ -107,12 +107,12 @@ type asyncProducer struct {
 
 // NewAsyncProducer creates a new AsyncProducer using the given broker addresses and configuration.
 func NewAsyncProducer(addrs []string, conf *Config) (AsyncProducer, error) {
-	// client(感觉有点像Java里面的 “MetadataClient” ？ )
+	// 1. 创建MetadataClient
 	client, err := NewClient(addrs, conf)
 	if err != nil {
 		return nil, err
 	}
-	// AsyncProducer
+	// 2. 创建AsyncProducer
 	return newAsyncProducer(client)
 }
 
@@ -475,7 +475,7 @@ func (p *asyncProducer) dispatcher() {
 			p.returnError(msg, ConfigurationError("Producing headers requires Kafka at least v0.11"))
 			continue
 		}
-
+		// --------------- ProducerMessage 的 size 校验
 		size := msg.ByteSize(version)
 		if size > p.conf.Producer.MaxMessageBytes {
 			p.returnError(msg, ConfigurationError(fmt.Sprintf("Attempt to produce message larger than configured Producer.MaxMessageBytes: %d > %d", size, p.conf.Producer.MaxMessageBytes)))
@@ -485,10 +485,10 @@ func (p *asyncProducer) dispatcher() {
 		// --------------- 找到此 msg 对应 Topic 的  buffered channel
 		handler := handlers[msg.Topic]
 		if handler == nil {
-			handler = p.newTopicProducer(msg.Topic)
+			handler = p.newTopicProducer(msg.Topic) // 创建了topicProducer
 			handlers[msg.Topic] = handler
 		}
-		// 将 ProducerMessage 放入对应 Topic 的 buffered channel 中
+		// 将 ProducerMessage 放入对应 TopicProducer 的 channel 中
 		handler <- msg
 	}
 
@@ -529,7 +529,7 @@ func (p *asyncProducer) newTopicProducer(topic string) chan<- *ProducerMessage {
 }
 
 func (tp *topicProducer) dispatch() {
-	for msg := range tp.input {
+	for msg := range tp.input { // 计算message分区
 		if msg.retries == 0 {
 			if err := tp.partitionMessage(msg); err != nil {
 				tp.parent.returnError(msg, err)
@@ -669,7 +669,9 @@ func (pp *partitionProducer) dispatch() {
 	if pp.leader != nil {
 		// 找到对应的 [ brokerProducer ]
 		pp.brokerProducer = pp.parent.getBrokerProducer(pp.leader)
+		// “飞行中 + 1”
 		pp.parent.inFlight.Add(1) // we're generating a syn message; track it so we don't shut down while it's still inflight
+		// 将 ProducerMessage 放入 brokerProducer的 input 的 Chain
 		pp.brokerProducer.input <- &ProducerMessage{Topic: pp.topic, Partition: pp.partition, flags: syn}
 	}
 
@@ -900,7 +902,8 @@ func (p *asyncProducer) newBrokerProducer(broker *Broker) *brokerProducer {
 				}
 				buf.Add(res)
 			}
-			// Send the head pending response or buffer another one
+			// brokerProducer 中 的 response channel中数据哪里来的， 从 pending channel中取出来的 -
+			//Send the head pending response or buffer another one
 			// so that we never block the callback
 			headRes := buf.Peek().(*brokerProducerResponse)
 			select {
@@ -957,7 +960,7 @@ func (bp *brokerProducer) run() {
 	var timerChan <-chan time.Time
 	Logger.Printf("producer/broker/%d starting up\n", bp.broker.ID())
 
-	// 事件循环 ？
+	// Go中Select机制 处理 brokerProducer 的多个 channel
 	for {
 		select {
 		case msg, ok := <-bp.input:
@@ -1003,6 +1006,7 @@ func (bp *brokerProducer) run() {
 				continue
 			}
 
+			// “攒批”，检查 buffer 是否存在足够空间以存放当前消息
 			if bp.buffer.wouldOverflow(msg) {
 				Logger.Printf("producer/broker/%d maximum request accumulated, waiting for space\n", bp.broker.ID())
 				if err := bp.waitForSpace(msg, false); err != nil {
@@ -1019,6 +1023,8 @@ func (bp *brokerProducer) run() {
 					continue
 				}
 			}
+
+			// ProducerMessage 添加至 produceSet
 			if err := bp.buffer.add(msg); err != nil {
 				bp.parent.returnError(msg, err)
 				continue
@@ -1039,6 +1045,7 @@ func (bp *brokerProducer) run() {
 			}
 		}
 
+		// todo: 这是什么操作？？？ ，brokerProducer 中 output chan<- *produceSet 是哪边写进去的 ？
 		if bp.timerFired || bp.buffer.readyToFlush() {
 			output = bp.output
 		} else {
@@ -1100,6 +1107,7 @@ func (bp *brokerProducer) rollOver() {
 	bp.buffer = newProduceSet(bp.parent)
 }
 
+// 根据 response 回调处理
 func (bp *brokerProducer) handleResponse(response *brokerProducerResponse) {
 	if response.err != nil {
 		bp.handleError(response.set, response.err)
@@ -1137,6 +1145,7 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 					msg.Timestamp = block.Timestamp
 				}
 			}
+			// 回调处理发送成功的消息时，这里打上了 实际的 Offset
 			for i, msg := range pSet.msgs {
 				msg.Offset = block.Offset + int64(i)
 			}
@@ -1418,7 +1427,7 @@ func (p *asyncProducer) getBrokerProducer(broker *Broker) *brokerProducer {
 	defer p.brokerLock.Unlock()
 
 	bp := p.brokers[broker]
-
+	// 创建 BrokerProducer
 	if bp == nil {
 		bp = p.newBrokerProducer(broker)
 		p.brokers[broker] = bp
